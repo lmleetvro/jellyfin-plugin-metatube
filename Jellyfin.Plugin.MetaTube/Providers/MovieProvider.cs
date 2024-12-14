@@ -13,6 +13,7 @@ using MovieInfo = MediaBrowser.Controller.Providers.MovieInfo;
 using MediaBrowser.Model.Logging;
 
 #else
+using Jellyfin.Data.Enums;
 using Microsoft.Extensions.Logging;
 #endif
 
@@ -21,7 +22,7 @@ namespace Jellyfin.Plugin.MetaTube.Providers;
 public class MovieProvider : BaseProvider, IRemoteMetadataProvider<Movie, MovieInfo>, IHasOrder
 {
     private const string AvBase = "AVBASE";
-    private const string GFriends = "GFriends";
+    private const string Gfriends = "Gfriends";
     private const string Rating = "JP-18+";
 
     private static readonly string[] AvBaseSupportedProviderNames = { "DUGA", "FANZA", "Getchu", "MGS" };
@@ -122,9 +123,11 @@ public class MovieProvider : BaseProvider, IRemoteMetadataProvider<Movie, MovieI
         result.Item.SetPid(Name, m.Provider, m.Id, pid.Position);
 
         // Set trailer url.
-        result.Item.SetTrailerUrl(!string.IsNullOrWhiteSpace(m.PreviewVideoUrl)
+        var trailerUrl = !string.IsNullOrWhiteSpace(m.PreviewVideoUrl)
             ? m.PreviewVideoUrl
-            : m.PreviewVideoHlsUrl);
+            : m.PreviewVideoHlsUrl;
+        if (!string.IsNullOrWhiteSpace(trailerUrl))
+            result.Item.SetTrailerUrl(trailerUrl);
 
         // Set community rating.
         if (Configuration.EnableRatings)
@@ -155,18 +158,27 @@ public class MovieProvider : BaseProvider, IRemoteMetadataProvider<Movie, MovieI
             result.AddPerson(new PersonInfo
             {
                 Name = m.Director,
+#if __EMBY__
                 Type = PersonType.Director
+#else
+                Type = PersonKind.Director
+#endif
             });
 
         // Add actors.
         foreach (var name in m.Actors ?? Enumerable.Empty<string>())
         {
-            result.AddPerson(new PersonInfo
+            var actor = new PersonInfo
             {
                 Name = name,
+#if __EMBY__
                 Type = PersonType.Actor,
-                ImageUrl = await GetActorImageUrl(name, cancellationToken)
-            });
+#else
+                Type = PersonKind.Actor,
+#endif
+            };
+            await SetActorImageUrl(actor, cancellationToken);
+            result.AddPerson(actor);
         }
 
         return result;
@@ -233,21 +245,37 @@ public class MovieProvider : BaseProvider, IRemoteMetadataProvider<Movie, MovieI
         return results;
     }
 
-    private async Task<string> GetActorImageUrl(string name, CancellationToken cancellationToken)
+    private async Task SetActorImageUrl(PersonInfo actor, CancellationToken cancellationToken)
     {
         try
         {
-            // Use GFriends as actor image provider.
-            foreach (var actor in (await ApiClient.SearchActorAsync(name, GFriends, false, cancellationToken))
-                     .Where(actor => actor.Images?.Any() == true))
-                return actor.Images.First();
+            var results = await ApiClient.SearchActorAsync(actor.Name, cancellationToken);
+            if (results?.Any() != true)
+            {
+                Logger.Warn("Actor not found: {0}", actor.Name);
+                return;
+            }
+
+            // Use the first result as the primary actor selection.
+            var firstResult = results.First();
+            if (firstResult.Images?.Any() == true)
+            {
+                actor.ImageUrl = ApiClient.GetPrimaryImageApiUrl(
+                    firstResult.Provider, firstResult.Id, firstResult.Images.First(), 0.5, true);
+                actor.SetPid(Name, firstResult.Provider, firstResult.Id);
+            }
+
+            // Use the Gfriends to update the actor profile image, if any.
+            foreach (var result in results.Where(result => result.Provider == Gfriends && result.Images?.Any() == true))
+            {
+                actor.ImageUrl = ApiClient.GetPrimaryImageApiUrl(
+                    result.Provider, result.Id, result.Images.First(), 0.5, true);
+            }
         }
         catch (Exception e)
         {
-            Logger.Error("Get actor image error: {0} ({1})", name, e.Message);
+            Logger.Error("Get actor image error: {0} ({1})", actor.Name, e.Message);
         }
-
-        return string.Empty;
     }
 
     private async Task ConvertToRealActorNames(MovieSearchResult m, CancellationToken cancellationToken)
@@ -257,7 +285,7 @@ public class MovieProvider : BaseProvider, IRemoteMetadataProvider<Movie, MovieI
         try
         {
             var searchResults = await ApiClient.SearchMovieAsync(m.Id, AvBase, cancellationToken);
-            if (!searchResults.Any())
+            if (searchResults?.Any() != true)
             {
                 Logger.Warn("Movie not found on AVBASE: {0}", m.Id);
             }
